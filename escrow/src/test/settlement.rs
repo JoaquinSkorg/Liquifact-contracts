@@ -17,10 +17,14 @@
 //! defined in `escrow/src/test.rs`. No cross-test state is shared.
 
 #[cfg(test)]
-use super::{default_init, deploy, free_addresses, setup, TARGET};
+use super::{
+    default_init, deploy, deploy_with_id, free_addresses, install_stellar_asset_token, setup,
+    TARGET,
+};
+use crate::MAX_DUST_SWEEP_AMOUNT;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
-    Address, Env,
+    Address, Env, String,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -461,6 +465,7 @@ fn test_cost_baseline_settle() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
     client.settle();
 }
 
@@ -490,14 +495,16 @@ fn settle_before_maturity_panics() {
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
-    let (escrow_id, client) = deploy_with_id(&env);
+    let (_escrow_id, client) = deploy_with_id(&env);
+    let maturity = 2_000u64;
+    env.ledger().set_timestamp(maturity - 1);
     client.init(
         &admin,
         &soroban_sdk::String::from_str(&env, "INV_MAT_001"),
         &sme,
-        &1_000i128,
+        &TARGET,
         &100i64,
-        &0u64,
+        &maturity,
         &token.id,
         &None,
         &treasury,
@@ -506,11 +513,8 @@ fn settle_before_maturity_panics() {
         &None,
     );
 
-    token.stellar.mint(&escrow_id, &5_000i128);
-    let before_t = token.token.balance(&treasury);
-    let swept = client.sweep_terminal_dust(&5_000i128);
-    assert_eq!(swept, 5_000i128);
-    assert_eq!(token.token.balance(&treasury), before_t + 5_000i128);
+    fund_to_target(&client, &env);
+    client.settle();
 }
 
 /// `settle` must succeed once ledger timestamp reaches maturity (inclusive).
@@ -523,13 +527,14 @@ fn settle_at_maturity_succeeds() {
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
     let (escrow_id, client) = deploy_with_id(&env);
+    let maturity = 2_000u64;
     client.init(
         &admin,
         &soroban_sdk::String::from_str(&env, "INV_MAT_002"),
         &sme,
-        &1_000i128,
+        &TARGET,
         &100i64,
-        &0u64,
+        &maturity,
         &token.id,
         &None,
         &treasury,
@@ -564,7 +569,7 @@ fn claim_investor_payout_succeeds_after_settle() {
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
-    let (escrow_id, client) = deploy_with_id(&env);
+    let (_escrow_id, client) = deploy_with_id(&env);
     client.init(
         &admin,
         &String::from_str(&env, "SW003"),
@@ -579,8 +584,11 @@ fn claim_investor_payout_succeeds_after_settle() {
         &None,
         &None,
     );
-    token.stellar.mint(&escrow_id, &100i128);
-    client.sweep_terminal_dust(&100i128);
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
 }
 
 /// `claim_investor_payout` must be idempotency-guarded: a second call panics.
@@ -656,7 +664,7 @@ fn claim_investor_payout_non_participant_panics() {
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
-    let (escrow_id, client) = deploy_with_id(&env);
+    let (_escrow_id, client) = deploy_with_id(&env);
     client.init(
         &admin,
         &String::from_str(&env, "SW006"),
@@ -674,10 +682,8 @@ fn claim_investor_payout_non_participant_panics() {
     let investor = Address::generate(&env);
     client.fund(&investor, &1_000i128);
     client.settle();
-
-    token.stellar.mint(&escrow_id, &50i128);
-    let swept = client.sweep_terminal_dust(&100i128);
-    assert_eq!(swept, 50i128);
+    let non_participant = Address::generate(&env);
+    client.claim_investor_payout(&non_participant);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -697,12 +703,12 @@ fn funding_snapshot_survives_withdraw() {
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
-    let (escrow_id, client) = deploy_with_id(&env);
+    let (_escrow_id, client) = deploy_with_id(&env);
     client.init(
         &admin,
         &String::from_str(&env, "SW007"),
         &sme,
-        &1_000i128,
+        &TARGET,
         &100i64,
         &0u64,
         &token.id,
@@ -712,6 +718,11 @@ fn funding_snapshot_survives_withdraw() {
         &None,
         &None,
     );
+    fund_to_target(&client, &env);
+    let snapshot_before = client.get_funding_close_snapshot();
+    client.withdraw();
+    let snapshot_after = client.get_funding_close_snapshot();
+    assert_eq!(snapshot_before, snapshot_after);
     assert_eq!(
         snapshot_after.unwrap().total_principal,
         TARGET,
@@ -729,8 +740,7 @@ fn funding_snapshot_survives_settle() {
 
     let snapshot_before = client.get_funding_close_snapshot();
     client.settle();
-    token.stellar.mint(&escrow_id, &10i128);
-
+    let snapshot_after = client.get_funding_close_snapshot();
     assert_eq!(snapshot_before, snapshot_after);
 }
 
@@ -886,15 +896,12 @@ fn investor_contribution_readable_after_withdraw() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
-
-    let investor = Address::generate(&env);
-    let contribution: i128 = TARGET;
-    client.fund(&investor, &contribution);
+    let investor = fund_to_target(&client, &env);
     client.withdraw();
 
     let recorded = client.get_contribution(&investor);
     assert_eq!(
-        recorded, contribution,
+        recorded, TARGET,
         "investor contribution must be readable after withdraw for refund accounting"
     );
 }
@@ -1184,7 +1191,7 @@ fn sweep_terminal_dust_panics_on_non_terminal_status() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     // status 0 — not terminal
-    let (_, treasury) = free_addresses(&env);
+    let (_, _treasury) = free_addresses(&env);
     client.sweep_terminal_dust(&1_000i128);
 }
 
@@ -1197,7 +1204,7 @@ fn sweep_terminal_dust_panics_when_legal_hold_active() {
     fund_to_target(&client, &env);
     client.withdraw(); // status → 3 (terminal)
     client.set_legal_hold(&true);
-    let (_, treasury) = free_addresses(&env);
+    let (_, _treasury) = free_addresses(&env);
     client.sweep_terminal_dust(&1_000i128);
 }
 
@@ -1209,7 +1216,7 @@ fn sweep_terminal_dust_panics_on_zero_amount() {
     default_init(&client, &env, &admin, &sme);
     fund_to_target(&client, &env);
     client.withdraw();
-    let (_, treasury) = free_addresses(&env);
+    let (_, _treasury) = free_addresses(&env);
     client.sweep_terminal_dust(&0i128);
 }
 
@@ -1231,7 +1238,7 @@ fn fund_below_min_contribution_floor_panics() {
     let floor: i128 = 1_000_0000000;
     client.init(
         &admin,
-        &soroban_sdk::String::from_str(&env, "INV-FLOOR-001"),
+        &soroban_sdk::String::from_str(&env, "INV_FLOOR_001"),
         &sme,
         &TARGET,
         &800i64,
@@ -1261,7 +1268,7 @@ fn fund_at_min_contribution_floor_succeeds() {
     let floor: i128 = 1_000_0000000;
     client.init(
         &admin,
-        &soroban_sdk::String::from_str(&env, "INV-FLOOR-002"),
+        &soroban_sdk::String::from_str(&env, "INV_FLOOR_002"),
         &sme,
         &TARGET,
         &800i64,
